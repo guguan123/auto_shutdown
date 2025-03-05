@@ -1,0 +1,9 @@
+{
+    "shutdown_times": [
+      {"hour": 12, "minute": 10},
+      {"hour": 22, "minute": 15}
+    ],
+    "enable_internet_time_check": true,
+    "max_time_diff": 60
+  }
+  
