@@ -136,11 +136,17 @@ time_t get_internet_time() {
 			continue;
 		}
 		// 设置超时
-		struct timeval tv;
-		tv.tv_sec = 500;
-		tv.tv_usec = 0;
-		setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-		setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
+		#ifdef _WIN32
+			int timeout = 5000; // 5秒，单位毫秒
+			setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+			setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+		#else
+			struct timeval tv;
+			tv.tv_sec = 5;
+			tv.tv_usec = 0;
+			setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+			setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
+		#endif
 
 		// 初始化NTP请求包
 		memset(&packet, 0, sizeof(ntp_packet));
