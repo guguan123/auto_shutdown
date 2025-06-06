@@ -1,18 +1,31 @@
 #include <stdio.h>        // 标准输入输出库，用于 printf 和 scanf 等函数
 #include <stdlib.h>       // 标准库，提供内存分配（如 malloc、free）和退出程序（如 exit）功能
 #include <stdbool.h>      // 布尔类型支持，定义 true 和 false
+#include <stdint.h>       // 定义 uint8_t, uint32_t 等固定宽度整数类型
 #include <string.h>       // 字符串操作库，用于 memset 和 memcpy 等函数
 #include <signal.h>       // 信号处理库，用于捕获和处理操作系统信号
 #include <time.h>         // 时间处理库，提供时间获取和转换功能（如 time 和 mktime）
-#include <windows.h>      // Windows 平台特定头文件，提供 Sleep 函数等
 #include <unistd.h>       // POSIX 系统头文件，提供 sleep 和 access 等函数（非 Windows）
-#include <curl/curl.h>    // libcurl 库，用于发起 HTTP 请求
-#include <cjson/cJSON.h>  // cJSON 库，用于解析 JSON 数据
+#include "cJSON.h"  // cJSON 库，用于解析 JSON 数据
+
+#ifdef _WIN32
+#include <winsock2.h> // Windows Sockets
+#include <ws2tcpip.h> // For getaddrinfo
+#include <windows.h>      // Windows 平台特定头文件，提供 Sleep 函数等
+#else
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h> // For getaddrinfo
+#endif
 
 // 定义常量，方便管理和维护
 #define CONFIG_FILE "config.json"           // 配置文件名
 #define CHECK_INTERVAL 10                   // 检查间隔时间（秒）
-#define TIME_API_URL "https://timeapi.io/api/Time/current/zone?timezone=Asia/Shanghai" // 获取时间的 API 地址
+#define NTP_PORT "123" // NTP服务器端口
+#define NTP_PACKET_SIZE 48 // NTP报文大小（字节）
+#define NTP_TIMESTAMP_DELTA 2208988800ULL // 从1900年到1970年1月1日0时0分0秒的秒数
 
 // 全局变量，用于控制程序是否继续运行（volatile 确保多线程或信号处理中的可见性）
 volatile bool keep_running = true;
@@ -58,115 +71,133 @@ void platform_sleep(int total_seconds) {
 #endif
 }
 
-// 定义用于存储 curl 请求响应的结构体
-struct memory {
-	char *response;  // 动态分配的内存，用于存储 HTTP 响应数据
-	size_t size;     // 响应数据的字节大小
-};
+// NTP报文结构 (Simplified)
+// 这是一个简化的NTP客户端请求/响应结构，只包含关键字段
+typedef struct {
+	uint8_t li_vn_mode;      // Leap Indicator, Version Number, Mode
+	uint8_t stratum;         // Stratum level of the local clock
+	uint8_t poll;            // Poll interval
+	uint8_t precision;       // Precision of the local clock
+	uint32_t root_delay;     // Total round trip delay to the primary reference source
+	uint32_t root_dispersion; // Total dispersion to the primary reference source
+	uint32_t ref_id;          // Reference ID
+	uint64_t ref_timestamp;   // Last update time of the local clock
+	uint64_t orig_timestamp;  // Originate Time
+	uint64_t recv_timestamp;  // Receive Time
+	uint64_t trans_timestamp; // Transmit Time (最重要的字段，客户端将其设置为当前时间，服务器会返回其发送响应的时间)
+} ntp_packet;
 
-// curl 的写回调函数，将 HTTP 响应数据保存到内存中
-static size_t write_callback(void *ptr, size_t size, size_t nmemb, struct memory *mem) {
-	size_t total_size = size * nmemb; // 计算本次接收的数据总大小
-	// 重新分配内存以容纳新数据（原大小 + 新数据大小 + 1 个字节用于 '\0'）
-	void *new_mem = realloc(mem->response, mem->size + total_size + 1);
-	if (new_mem == NULL) {            // 如果内存分配失败
-		free(mem->response);          // 释放已有内存
-		fprintf(stderr, "Out of memory!\n"); // 输出错误信息
-		exit(1);                      // 退出程序
-	}
-	mem->response = new_mem;          // 更新内存指针
-	// 将新数据复制到已有数据的末尾
-	memcpy(mem->response + mem->size, ptr, total_size);
-	mem->size += total_size;          // 更新数据总大小
-	mem->response[mem->size] = '\0';  // 在末尾添加字符串结束符
-	return total_size;                // 返回处理的数据量，通知 curl 已成功处理
+// 清理Winsock (仅Windows)
+#ifdef _WIN32
+void cleanup_winsock() {
+	WSACleanup();
 }
+#endif
 
-// 清理 curl 和 JSON 相关的资源，防止内存泄漏
-void cleanup_resources(CURL *curl, struct memory *chunk, cJSON *json) {
-	if (chunk->response) free(chunk->response); // 释放 HTTP 响应数据的内存
-	if (curl) curl_easy_cleanup(curl);          // 清理 curl 会话
-	if (json) cJSON_Delete(json);               // 释放 JSON 对象
-	curl_global_cleanup();                      // 清理 libcurl 全局资源
-}
-
-// 获取互联网时间，通过 API 返回当前时间
+// 获取互联网时间，通过 NTP 服务器获取当前时间
 time_t get_internet_time() {
-	CURL *curl = NULL;               // curl 会话句柄
-	CURLcode res;                    // curl 操作的结果代码
-	struct memory chunk = { .response = NULL, .size = 0 }; // 初始化内存结构体，用于存储响应
-	cJSON *json = NULL;              // JSON 对象指针
+	time_t result_time = -1;
+#ifdef _WIN32
+	WSADATA wsaData;
+	int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (iResult != 0) {
+		fprintf(stderr, "WSAStartup failed: %d\n", iResult);
+		return -1;
+	}
+#endif
 
-	curl_global_init(CURL_GLOBAL_DEFAULT); // 初始化 libcurl 全局环境
-	curl = curl_easy_init();         // 创建一个 curl 会话
+	int sockfd = -1;
+	struct addrinfo hints, *servinfo, *p;
+	int rv;
+	ntp_packet packet;
 
-	if (!curl) {                     // 如果 curl 初始化失败
-		fprintf(stderr, "Failed to initialize curl\n"); // 输出错误信息
-		cleanup_resources(curl, &chunk, json); // 清理资源
-		return -1;                   // 返回错误值
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC; // IPv4 或 IPv6
+	hints.ai_socktype = SOCK_DGRAM; // UDP 套接字
+
+	// 尝试解析 time.windows.com
+	rv = getaddrinfo("time.windows.com", NTP_PORT, &hints, &servinfo);
+	if (rv != 0) {
+		fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(rv));
+#ifdef _WIN32
+		cleanup_winsock();
+#endif
+		return -1;
 	}
 
-	// 设置 HTTP 请求头，指定接受 JSON 格式数据
-	struct curl_slist *headers = NULL;
-	headers = curl_slist_append(headers, "Accept: application/json");
-	headers = curl_slist_append(headers, "User-Agent: curl/1.0");
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	// 遍历所有解析到的地址，尝试发送和接收
+	for (p = servinfo; p != NULL; p = p->ai_next) {
+		sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+		if (sockfd == -1) {
+			continue;
+		}
+		// 设置超时
+		struct timeval tv;
+		tv.tv_sec = 500;
+		tv.tv_usec = 0;
+		setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+		setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
 
-	// 禁用 SSL 验证
-	//curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-	//curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+		// 初始化NTP请求包
+		memset(&packet, 0, sizeof(ntp_packet));
+		packet.li_vn_mode = 0x1B; // Leap Indicator (0), Version (3), Mode (3: Client)
 
-	// 配置 curl 请求选项
-	curl_easy_setopt(curl, CURLOPT_URL, TIME_API_URL);       // 设置请求的 URL
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback); // 设置写回调函数
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);       // 指定写回调的目标内存
-	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);           // 最大重定向次数
+		// 发送NTP请求
+		if (sendto(sockfd, (char*)&packet, sizeof(ntp_packet), 0, p->ai_addr, p->ai_addrlen) == -1) {
+#ifdef _WIN32
+			closesocket(sockfd);
+#else
+			close(sockfd);
+#endif
+			sockfd = -1;
+			continue;
+		}
 
-	// 执行 HTTP 请求
-	res = curl_easy_perform(curl);
-	if (res != CURLE_OK) {           // 如果请求失败
-		fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res)); // 输出错误信息
-		cleanup_resources(curl, &chunk, json); // 清理资源
-		return -1;                   // 返回错误值
+		// 接收NTP响应
+		socklen_t addr_len = (socklen_t)p->ai_addrlen;
+		if (recvfrom(sockfd, (char*)&packet, sizeof(ntp_packet), 0, p->ai_addr, &addr_len) == -1) {
+#ifdef _WIN32
+			int err = WSAGetLastError();
+			// 打印详细的错误信息，帮助调试
+			fprintf(stderr, "recvfrom failed on current address, WSAGetLastError = %d\n", err);
+			closesocket(sockfd);
+#else
+			perror("recvfrom failed on current address");
+			close(sockfd);
+#endif
+			sockfd = -1;
+			continue;
+		}
+		// 如果成功接收，就退出循环
+		break; 
 	}
 
-	// 解析返回的 JSON 数据
-	json = cJSON_Parse(chunk.response);
-	if (json == NULL) {              // 如果 JSON 解析失败
-		fprintf(stderr, "Failed to parse JSON response: %s\n", chunk.response); // 输出错误信息
-		cleanup_resources(curl, &chunk, json); // 清理资源
-		return -1;                   // 返回错误值
+	if (sockfd == -1) {
+		fprintf(stderr, "Failed to communicate with NTP server after trying all addresses.\n");
+		freeaddrinfo(servinfo);
+#ifdef _WIN32
+		cleanup_winsock();
+#endif
+		return -1;
 	}
 
-	// 从 JSON 中提取 "datetime" 字段
-	cJSON *datetime_item = cJSON_GetObjectItem(json, "datetime");
-	if (datetime_item == NULL) {     // 如果未找到 "datetime" 字段
-		fprintf(stderr, "Failed to find 'datetime' in JSON response\n"); // 输出错误信息
-		cleanup_resources(curl, &chunk, json); // 清理资源
-		return -1;                   // 返回错误值
-	}
+	// 从NTP报文中提取时间戳
+	// NTP时间戳是64位无符号整数，前32位是秒数，后32位是小数部分
+	// 需要将网络字节序（大端）转换为主机字节序
+	uint32_t ntp_seconds = ntohl(packet.trans_timestamp >> 32);
 
-	// 解析时间字符串（如 "2023-10-15T14:30:00"）
-	const char *datetime = datetime_item->valuestring;
-	struct tm tm = {0};              // 初始化时间结构体
-	if (sscanf(datetime, "%4d-%2d-%2dT%2d:%2d:%2d",
-			   &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
-			   &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6) { // 解析失败
-		fprintf(stderr, "Failed to parse datetime from response.\n"); // 输出错误信息
-		cleanup_resources(curl, &chunk, json); // 清理资源
-		return -1;                   // 返回错误值
-	}
+	// 将NTP时间（从1900年开始）转换为UNIX时间（从1970年开始）
+	result_time = (time_t)(ntp_seconds - NTP_TIMESTAMP_DELTA);
 
-	// 调整时间结构体的年份和月份（tm_year 是从 1900 开始，tm_mon 是 0-11）
-	tm.tm_year -= 1900;
-	tm.tm_mon -= 1;
+#ifdef _WIN32
+	closesocket(sockfd);
+	cleanup_winsock();
+#else
+	close(sockfd);
+#endif
+	freeaddrinfo(servinfo);
 
-	// 将 struct tm 转换为 time_t 类型的时间戳
-	time_t result = mktime(&tm);
-
-	// 清理资源并返回结果
-	cleanup_resources(curl, &chunk, json);
-	return result;
+	return result_time;
 }
 
 // 从 JSON 配置文件中读取配置信息
