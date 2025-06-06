@@ -81,10 +81,14 @@ typedef struct {
 	uint32_t root_delay;     // Total round trip delay to the primary reference source
 	uint32_t root_dispersion; // Total dispersion to the primary reference source
 	uint32_t ref_id;          // Reference ID
-	uint64_t ref_timestamp;   // Last update time of the local clock
-	uint64_t orig_timestamp;  // Originate Time
-	uint64_t recv_timestamp;  // Receive Time
-	uint64_t trans_timestamp; // Transmit Time (最重要的字段，客户端将其设置为当前时间，服务器会返回其发送响应的时间)
+	uint32_t ref_timestamp_secs;// Last update time of the local clock
+	uint32_t ref_timestamp_fraq;
+	uint32_t orig_timestamp_secs;// Originate Time
+	uint32_t orig_timestamp_fraq;
+	uint32_t recv_timestamp_secs;// Receive Time
+	uint32_t recv_timestamp_fraq;
+	uint32_t trans_timestamp_secs;// Transmit Time (最重要的字段，客户端将其设置为当前时间，服务器会返回其发送响应的时间)
+	uint32_t trans_timestamp_fraq;
 } ntp_packet;
 
 // 清理Winsock (仅Windows)
@@ -184,7 +188,8 @@ time_t get_internet_time() {
 	// 从NTP报文中提取时间戳
 	// NTP时间戳是64位无符号整数，前32位是秒数，后32位是小数部分
 	// 需要将网络字节序（大端）转换为主机字节序
-	uint32_t ntp_seconds = ntohl(packet.trans_timestamp >> 32);
+	uint32_t ntp_seconds = ntohl(packet.trans_timestamp_secs);
+	result_time = (time_t)(ntp_seconds - NTP_TIMESTAMP_DELTA);
 
 	// 将NTP时间（从1900年开始）转换为UNIX时间（从1970年开始）
 	result_time = (time_t)(ntp_seconds - NTP_TIMESTAMP_DELTA);
@@ -351,7 +356,7 @@ int main(int argc, char *argv[]) {
 	// 主循环，检查是否需要关机
 	while (keep_running) {
 		time_t now = time(NULL);         // 获取当前系统时间
-		printf("System time: %s", ctime(&now)); // 打印当前时间
+		printf("System time: %s", ctime(&now)); // 打印当前系统时间
 
 		bool shutdown = false;           // 是否需要关机
 		// 检查每个关机时间点
@@ -365,9 +370,10 @@ int main(int argc, char *argv[]) {
 		if (shutdown) {                  // 如果需要关机
 			if (enable_internet_time_check) { // 如果启用了互联网时间检查
 				time_t internet_time = get_internet_time(); // 获取互联网时间
-				if (internet_time == -1) { // 如果获取失败
+				if (internet_time == (time_t)-1) { // 如果获取失败
 					fprintf(stderr, "Failed to get internet time\n");
 				} else {
+					printf("Internet time: %s", ctime(&internet_time)); // 打印互联网当前时间
 					// 检查系统时间与互联网时间的差值
 					if (abs(difftime(now, internet_time)) > max_time_diff) {
 						printf("System time and internet time are out of sync!\n"); // 时间不同步
